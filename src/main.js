@@ -6,6 +6,9 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { loadNPZ } from "./npz-loader.js";
+import viewerInputConfig from "./viewer-input-config.js";
+import { fromUrl as geotiffFromUrl } from "geotiff";
 import "./style.css";
 
 
@@ -30,9 +33,9 @@ const DEFAULT_MESH_ROWS = 512;
 const DEFAULT_MESH_COLS = 512;
 const DEFAULT_GRID_STEP = 2;
 
-// Person 3 generated terrain is Z-up.
-// Three.js scene is Y-up.
-// Therefore GLB is rotated -90 degrees around X.
+// Person 3 generated terrain is already Z-up.
+// X/Y are the ground plane and Z is elevation.
+// Do NOT rotate the GLB. The camera/controls are configured for Z-up.
 const SOURCE_UP_AXIS = "z";
 
 // Keep null until backend gives you a real endpoint.
@@ -132,6 +135,15 @@ const btnFlythroughStop = $("btn-flythrough-stop");
 
 
 // ============================================================================
+// DOM — BEFORE / AFTER COMPARISON
+// ============================================================================
+
+const comparisonDockEl = $("comparison-dock");
+const comparisonSliderEl = $("comparison-slider");
+const comparisonValueEl = $("comparison-value");
+
+
+// ============================================================================
 // DOM — RIGHT SIDEBAR
 // ============================================================================
 
@@ -140,12 +152,18 @@ const elevationBaseEl = $("elevation-base");
 const elevationReliefEl = $("elevation-relief");
 
 const elevationChartEl = $("elevation-profile-chart");
+const elevationLegendMinEl = $("elevation-legend-min");
+const elevationLegendMidEl = $("elevation-legend-mid");
+const elevationLegendMaxEl = $("elevation-legend-max");
 
 const metadataDatasetEl = $("metadata-dataset");
 const metadataElevationRangeEl = $("metadata-elevation-range");
 const metadataResolutionEl = $("metadata-resolution");
 const metadataGridEl = $("metadata-grid");
 const metadataMeshEl = $("metadata-mesh");
+const metadataCoordinatesEl = $("metadata-coordinates");
+const metadataDatumEl = $("metadata-datum");
+const metadataCalibrationEl = $("metadata-calibration");
 
 
 // ============================================================================
@@ -170,6 +188,7 @@ const btnHillshade = $("btn-hillshade");
 const btnWireframe = $("btn-wireframe");
 const btnSlopeHeatmap = $("btn-slope-heatmap");
 const btnTerrainTexture = $("btn-terrain-texture");
+const btnElevationColor = $("btn-elevation-color");
 
 
 // ============================================================================
@@ -188,6 +207,24 @@ const inspectionConfidenceEl = $("inspection-confidence");
 const inspectionChangeEl = $("inspection-change");
 const inspectionBeforeEl = $("inspection-before");
 const inspectionDuringEl = $("inspection-during");
+
+
+// ============================================================================
+// DOM — ANALYSIS MAP (2D top-down elevation raster + region select)
+// ============================================================================
+
+const analysisMapCardEl = $("analysis-map-card");
+const analysisMapEl = $("analysis-map");
+const analysisMapCanvasEl = $("analysis-map-canvas");
+const analysisMapMarkerEl = $("analysis-map-marker");
+const analysisMapSelectionEl = $("analysis-map-selection");
+
+const regionPanelEl = $("region-analysis-panel");
+const regionCountEl = $("region-count");
+const regionAvgChangeEl = $("region-avg-change");
+const regionMinMaxChangeEl = $("region-minmax-change");
+const regionAvgElevationEl = $("region-avg-elevation");
+const regionSignificantCountEl = $("region-significant-count");
 
 
 // ============================================================================
@@ -254,6 +291,7 @@ let autoRotateOn = false;
 let wireframeOn = false;
 let hillshadeOn = false;
 let slopeHeatmapOn = false;
+let elevationColorOn = false;
 
 let markerWorldPoint = null;
 
@@ -270,6 +308,23 @@ let zExaggeration = zExaggerationEl
   : 1.0;
 
 let systemMessageHideTimer = null;
+
+// ------------------------------------------------------------------
+// BEFORE / AFTER COMPARISON STATE
+//
+// comparisonEntries: one entry per mesh in the After model that has a
+// matching same-vertex-count mesh in the Before model (matched by
+// traversal order, since GLB scenes from the same pipeline export
+// meshes in a stable order). Each entry stores untouched copies of
+// both position buffers so the live geometry attribute can be
+// re-derived from scratch on every slider move, instead of drifting
+// from repeated lerp-into-itself rounding.
+// ------------------------------------------------------------------
+
+let comparisonEntries = [];
+let comparisonReady = false;
+let comparisonT = 1; // 0 = Before, 1 = After — matches slider default (100 = After)
+let comparisonUpdatePending = false;
 
 
 // ============================================================================
@@ -290,6 +345,7 @@ const camera = new THREE.PerspectiveCamera(
   30000
 );
 
+camera.up.set(0, 0, 1);
 camera.position.set(500, 400, 500);
 
 
@@ -560,18 +616,12 @@ function applySolarPosition() {
       0
     );
 
+  // Z is the vertical/elevation axis.
+  // Azimuth moves around the X/Y ground plane.
   sun.position.set(
-    center.x +
-    Math.cos(az) *
-    horizontal,
-
-    center.y +
-    Math.sin(el) *
-    SUN_DISTANCE,
-
-    center.z +
-    Math.sin(az) *
-    horizontal
+    center.x + Math.cos(az) * horizontal,
+    center.y + Math.sin(az) * horizontal,
+    center.z + Math.sin(el) * SUN_DISTANCE
   );
 
   sun.target.position.copy(center);
@@ -625,6 +675,8 @@ controls.autoRotateSpeed = 1.1;
 
 const loader =
   new GLTFLoader();
+
+
 
 
 // ============================================================================
@@ -825,12 +877,16 @@ function updateLoadingProgress(
 
 
 function hideLoading() {
+  const overlay = document.getElementById("loading-overlay");
 
-  loadingOverlayEl?.classList.add(
-    "is-hidden"
-  );
+  if (overlay) {
+    overlay.classList.add("is-hidden");
+    overlay.style.display = "none";
+    overlay.style.visibility = "hidden";
+    overlay.style.opacity = "0";
+    overlay.style.pointerEvents = "none";
+  }
 }
-
 
 // ============================================================================
 // TABS
@@ -997,22 +1053,17 @@ function prepareModel(root) {
 
 
   // ------------------------------------------------------------
-  // Person 3 Z-UP -> Three.js Y-UP
+  // Person 3 output is already Z-UP.
+  // X/Y = terrain plane, Z = elevation.
+  // No axis rotation is applied here.
   // ------------------------------------------------------------
 
-  if (
-    SOURCE_UP_AXIS === "z"
-  ) {
-
-    root.rotation.x =
-      -Math.PI / 2;
-  }
-
+  root.rotation.set(0, 0, 0);
   root.updateMatrixWorld(true);
 
-
   // ------------------------------------------------------------
-  // Center model
+  // Center only the horizontal X/Y position.
+  // Keep Z as the actual elevation axis.
   // ------------------------------------------------------------
 
   const box =
@@ -1024,14 +1075,8 @@ function prepareModel(root) {
       new THREE.Vector3()
     );
 
-  root.position.x -=
-    center.x;
-
-  root.position.z -=
-    center.z;
-
-  root.position.y -=
-    box.min.y;
+  root.position.x -= center.x;
+  root.position.y -= center.y;
 
   root.updateMatrixWorld(true);
 
@@ -1126,8 +1171,8 @@ function frameModel(model) {
   const direction =
     new THREE.Vector3(
       1,
-      0.7,
-      1
+      0.8,
+      0.85
     ).normalize();
 
 
@@ -1270,34 +1315,45 @@ function applyCameraPreset(
 
   if (kind === "top") {
 
+    // Look straight down the Z elevation axis.
     direction =
       new THREE.Vector3(
-        0.001,
-        1,
-        0.001
+        0,
+        0,
+        1
       ).normalize();
+
+    // Avoid camera roll when looking straight down.
+    camera.up.set(0, 1, 0);
 
   }
 
   else if (kind === "iso") {
 
+    // X/Y = terrain plane, Z = elevation.
     direction =
       new THREE.Vector3(
         1,
         0.9,
-        1
+        0.8
       ).normalize();
+
+    camera.up.set(0, 0, 1);
 
   }
 
   else if (kind === "profile") {
 
+    // Look across the terrain in Y,
+    // with Z remaining vertical.
     direction =
       new THREE.Vector3(
+        0,
         1,
-        0.12,
         0
       ).normalize();
+
+    camera.up.set(0, 0, 1);
 
   }
 
@@ -1307,8 +1363,10 @@ function applyCameraPreset(
       new THREE.Vector3(
         1,
         0.7,
-        1
+        0.8
       ).normalize();
+
+    camera.up.set(0, 0, 1);
 
   }
 
@@ -1472,6 +1530,145 @@ function disposeModel(model) {
 
 
 // ============================================================================
+// READ REAL GEOREFERENCING FROM THE SRTM FILE
+// This is what makes Coordinates / Spatial Resolution / Datum show
+// actual values instead of "Not provided by pipeline yet" — it reads
+// the GeoTIFF's own embedded tags, nothing is typed in by hand.
+// ============================================================================
+
+async function loadSRTMMetadata(url) {
+
+  if (!url) {
+    return;
+  }
+
+  try {
+
+    const tiff = await geotiffFromUrl(url);
+    const image = await tiff.getImage();
+
+    // [minX, minY, maxX, maxY] in the file's native CRS units.
+    const bbox = image.getBoundingBox();
+
+    // Pixel size in native units. SRTM tiles are almost always
+    // delivered in geographic degrees (EPSG:4326), not meters —
+    // so we convert approximately for a human-readable value and
+    // say so, rather than silently mislabeling degrees as meters.
+    const [resX] = image.getResolution();
+
+    const geoKeys = image.getGeoKeys ? image.getGeoKeys() : {};
+    const epsg =
+      (geoKeys && (geoKeys.ProjectedCSTypeGeoKey || geoKeys.GeographicTypeGeoKey)) ||
+      null;
+
+    const isLikelyDegrees = Math.abs(resX) < 1;
+    const approxMeters = Math.abs(resX) * 111320; // rough, equator-based
+
+    const resolutionText = isLikelyDegrees
+      ? `~${approxMeters.toFixed(1)} m/px (from ${Math.abs(resX).toFixed(6)}°/px, approx.)`
+      : `${Math.abs(resX).toFixed(2)} m/px`;
+
+    const coordinatesText = isLikelyDegrees
+      ? `Lat/Lon: ${bbox[1].toFixed(4)}, ${bbox[0].toFixed(4)} — ${bbox[3].toFixed(4)}, ${bbox[2].toFixed(4)}`
+      : `Easting/Northing (m): ${bbox[0].toFixed(1)}, ${bbox[1].toFixed(1)} — ${bbox[2].toFixed(1)}, ${bbox[3].toFixed(1)}`;
+
+    const horizontalDatumText = epsg
+      ? `EPSG:${epsg}`
+      : "WGS84 (assumed — SRTM default, EPSG code not found in file)";
+
+    // SRTM elevation values are referenced to the EGM96 geoid, not
+    // the ellipsoid — this is the standard vertical datum for SRTM
+    // and isn't something we can read from the GeoTIFF's own tags,
+    // so it's stated as the known SRTM convention rather than parsed.
+    const verticalDatumText = "EGM96 geoid (SRTM standard)";
+
+    if (viewportGeorefEl) {
+      viewportGeorefEl.textContent = "Georeferenced (SRTM)";
+    }
+
+    if (metadataCoordinatesEl) {
+      metadataCoordinatesEl.textContent = coordinatesText;
+    }
+
+    if (metadataResolutionEl) {
+      metadataResolutionEl.textContent = resolutionText;
+    }
+
+    if (metadataDatumEl) {
+      metadataDatumEl.textContent =
+        `Horizontal: ${horizontalDatumText} · Vertical: ${verticalDatumText}`;
+    }
+
+    // Keep the config object itself in sync, so anything else reading
+    // viewerInputConfig.metadata later in this session sees real
+    // values instead of the original nulls.
+    if (viewerInputConfig && viewerInputConfig.metadata) {
+      viewerInputConfig.metadata.spatialResolution = resolutionText;
+      viewerInputConfig.metadata.coordinates = coordinatesText;
+      viewerInputConfig.metadata.horizontalDatum = horizontalDatumText;
+      viewerInputConfig.metadata.verticalDatum = verticalDatumText;
+    }
+
+    console.log(
+      "[SASA MINE] SRTM metadata loaded:",
+      { bbox, resX, epsg }
+    );
+
+  } catch (error) {
+
+    console.error(
+      "[SASA MINE] Could not read SRTM GeoTIFF metadata:",
+      error
+    );
+
+    setStatus(
+      "Could not read SRTM file metadata — check console for details.",
+      true
+    );
+  }
+}
+
+
+// ============================================================================
+// DERIVE LABEL FROM FILENAME
+// This is what makes the model name reflect the actual file the
+// pipeline handed us, instead of a hardcoded string like
+// "Configured terrain" or a leftover test label.
+// ============================================================================
+
+function deriveLabelFromUrl(url) {
+
+  if (!url) {
+    return "Terrain Model";
+  }
+
+  try {
+
+    const clean = url.split("?")[0].split("#")[0];
+    const filename = clean.substring(clean.lastIndexOf("/") + 1);
+    const withoutExt = filename.replace(/\.(glb|gltf)$/i, "");
+
+    if (!withoutExt) {
+      return "Terrain Model";
+    }
+
+    return withoutExt
+      .replace(/[_-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .split(" ")
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" ");
+
+  } catch (error) {
+
+    console.warn("[SASA MINE] Could not derive label from URL:", url, error);
+    return "Terrain Model";
+  }
+}
+
+
+// ============================================================================
 // LOAD GLB FROM URL
 // ============================================================================
 
@@ -1560,6 +1757,11 @@ function loadGLBFromURL(
               activeModel =
                 null;
             }
+
+
+            // A fresh model load invalidates any before/after pairing
+            // that was built against the previous After mesh.
+            clearComparisonState();
 
 
             // Add new model.
@@ -1877,17 +2079,62 @@ function updateModelMetadataPanels(
   }
 
 
+  // ------------------------------------------------------------
+  // These read from the REAL viewer-input-config.js schema:
+  // viewerInputConfig.metadata = { datasetName, spatialResolution,
+  // coordinates, horizontalDatum, verticalDatum, calibration }.
+  // All start out null in local testing — loadSRTMMetadata() fills
+  // in real values from the actual .tif where it can. Anything still
+  // null falls back to an honest label, never a fabricated value.
+  // ------------------------------------------------------------
+
+  const configMeta = (viewerInputConfig && viewerInputConfig.metadata) || {};
+
   if (viewportGeorefEl) {
 
     viewportGeorefEl.textContent =
-      "Relative";
+      configMeta.coordinates || configMeta.spatialResolution
+        ? "Georeferenced"
+        : "Not provided by pipeline yet";
   }
 
 
   if (metadataResolutionEl) {
 
     metadataResolutionEl.textContent =
-      "Unknown";
+      configMeta.spatialResolution ||
+      "Not provided by pipeline yet";
+  }
+
+
+  if (metadataCoordinatesEl) {
+
+    metadataCoordinatesEl.textContent =
+      configMeta.coordinates ||
+      "Not provided by pipeline yet";
+  }
+
+
+  if (metadataDatumEl) {
+
+    const horiz = configMeta.horizontalDatum;
+    const vert = configMeta.verticalDatum;
+
+    metadataDatumEl.textContent =
+      (horiz || vert)
+        ? [
+            horiz ? `Horizontal: ${horiz}` : null,
+            vert ? `Vertical: ${vert}` : null,
+          ].filter(Boolean).join(" · ")
+        : "Not provided by pipeline yet";
+  }
+
+
+  if (metadataCalibrationEl) {
+
+    metadataCalibrationEl.textContent =
+      configMeta.calibration ||
+      "Relative depth (uncalibrated)";
   }
 
 
@@ -1935,15 +2182,43 @@ function updateElevationPanels() {
     base === undefined
   ) {
 
-    peak =
-      activeModel.size.y;
+    const elevationBox = new THREE.Box3().setFromObject(
+    activeModel.root
+);
 
-    base = 0;
+peak = elevationBox.max.z;
+base = elevationBox.min.z;
   }
 
 
   const relief =
     peak - base;
+
+
+  // Legend labels — only meaningful against real per-point data,
+  // not the GLB-mesh fallback range used above for peak/base display.
+  const realRange =
+    gridLoaded && terrainData?.elevation
+      ? scanGridRange(terrainData.elevation)
+      : null;
+
+  if (elevationLegendMinEl && elevationLegendMidEl && elevationLegendMaxEl) {
+
+    if (realRange) {
+
+      const mid = (realRange.min + realRange.max) / 2;
+
+      elevationLegendMinEl.textContent = formatValue(realRange.min, " m");
+      elevationLegendMidEl.textContent = formatValue(mid, " m");
+      elevationLegendMaxEl.textContent = formatValue(realRange.max, " m");
+
+    } else {
+
+      elevationLegendMinEl.textContent = "---";
+      elevationLegendMidEl.textContent = "---";
+      elevationLegendMaxEl.textContent = "---";
+    }
+  }
 
 
   if (elevationPeakEl) {
@@ -2064,6 +2339,85 @@ function scanGridRange(grid) {
     min,
     max,
   };
+}
+
+
+// ============================================================================
+// COMPUTE SLOPE FROM ELEVATION
+//
+// Central-difference gradient over the grid, converted to a slope
+// angle in degrees. Cell spacing is treated as 1 grid unit rather
+// than a real-world distance, since the analysis grid's physical
+// resolution isn't reliably known (the SRTM file's resolution is a
+// separate raster, not guaranteed to match this grid 1:1) — so this
+// is a relative, uncalibrated slope, consistent with how the app
+// already labels elevation itself ("Relative depth (uncalibrated)").
+// Good enough to drive a heatmap and a rough terrain-type estimate;
+// not a substitute for a real slope field from the pipeline.
+// ============================================================================
+
+function computeSlopeGrid(elevation, rows, cols) {
+
+  if (!elevation || !rows || !cols) {
+    return null;
+  }
+
+  const result = new Float32Array(rows * cols);
+
+  for (let row = 0; row < rows; row++) {
+
+    for (let col = 0; col < cols; col++) {
+
+      const center = getGridValue(elevation, row, col, cols);
+
+      if (typeof center !== "number") {
+
+        result[row * cols + col] = NaN;
+        continue;
+      }
+
+      const left = getGridValue(elevation, row, Math.max(col - 1, 0), cols);
+      const right = getGridValue(elevation, row, Math.min(col + 1, cols - 1), cols);
+      const up = getGridValue(elevation, Math.max(row - 1, 0), col, cols);
+      const down = getGridValue(elevation, Math.min(row + 1, rows - 1), col, cols);
+
+      const dzdx =
+        (typeof left === "number" && typeof right === "number")
+          ? (right - left) / 2
+          : 0;
+
+      const dzdy =
+        (typeof up === "number" && typeof down === "number")
+          ? (down - up) / 2
+          : 0;
+
+      const slopeRad = Math.atan(Math.sqrt(dzdx * dzdx + dzdy * dzdy));
+
+      result[row * cols + col] = THREE.MathUtils.radToDeg(slopeRad);
+    }
+  }
+
+  return result;
+}
+
+
+// Rough, clearly-labeled terrain classification from slope alone —
+// used only as a fallback when the analysis file has no categorical
+// terrain field of its own (this NPZ schema doesn't, per the comment
+// on normalizeGrid). Always suffixed "(est.)" by the caller so it's
+// never confused with a real pipeline-provided classification.
+function deriveTerrainTypeLabel(slopeDegrees) {
+
+  if (typeof slopeDegrees !== "number" || Number.isNaN(slopeDegrees)) {
+    return null;
+  }
+
+  if (slopeDegrees < 5) return "Flat";
+  if (slopeDegrees < 15) return "Gentle Slope";
+  if (slopeDegrees < 30) return "Moderate Slope";
+  if (slopeDegrees < 45) return "Steep Slope";
+
+  return "Very Steep";
 }
 
 
@@ -2267,7 +2621,104 @@ function formatValue(
 
 
 // ============================================================================
+// INFER GRID SHAPE FROM ACTUAL DATA
+// NPZ files don't necessarily carry an explicit "this is 1024 wide"
+// tag — they're just raw arrays. Trusting a hardcoded default here
+// silently breaks every indexed (row, col) lookup if the real shape
+// differs, even though whole-array scans (min/max) still work fine
+// regardless of shape. Always prefer the real shape when we can see it.
+// ============================================================================
+
+function inferGridShape(grid) {
+
+  if (!grid) {
+    return null;
+  }
+
+  // Properly nested 2D array — shape is unambiguous.
+  if (Array.isArray(grid) && Array.isArray(grid[0])) {
+
+    return {
+      rows: grid.length,
+      cols: grid[0].length,
+    };
+  }
+
+  // Flat array/typed array — only safe to guess if it's a perfect
+  // square. A non-square flat array needs explicit dimensions from
+  // the source (add rows/cols to the NPZ export), we can't guess it.
+  if (Array.isArray(grid) || ArrayBuffer.isView(grid)) {
+
+    const n = grid.length;
+    const side = Math.round(Math.sqrt(n));
+
+    if (side * side === n) {
+
+      return {
+        rows: side,
+        cols: side,
+      };
+    }
+  }
+
+  return null;
+}
+
+
+// ============================================================================
 // GRID NORMALIZATION
+// ============================================================================
+
+// ============================================================================
+// EXTRACT FIELD (handles both raw arrays and {data, shape} wrappers,
+// which is the standard way most .npy/.npz JS parsers preserve the
+// shape info from the file header alongside the flat data buffer)
+// ============================================================================
+
+function extractField(raw, keys) {
+
+  for (const key of keys) {
+
+    const value = raw[key];
+
+    if (value === undefined || value === null) {
+      continue;
+    }
+
+    if (
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      !ArrayBuffer.isView(value) &&
+      value.data !== undefined
+    ) {
+
+      return {
+        data: value.data,
+        shape: Array.isArray(value.shape) ? value.shape : null,
+      };
+    }
+
+    return { data: value, shape: null };
+  }
+
+  return { data: null, shape: null };
+}
+
+
+// ============================================================================
+// GRID NORMALIZATION
+//
+// Confirmed real field names in Person 2's before/during NPZ export
+// (verified directly against the actual file, not guessed):
+//   elevation_before, elevation_after, confidence_before,
+//   confidence_after, elevation_change, class_changed,
+//   combined_confidence, significant_change
+//
+// This file has NO separate slope array and NO categorical terrain
+// class array — only a boolean "did the class change" flag. Slope
+// and Terrain Type will correctly stay unavailable for this file;
+// that's real, not a bug. A single-snapshot analysis file (if one
+// exists) would need those fields added separately.
 // ============================================================================
 
 function normalizeGrid(raw) {
@@ -2280,71 +2731,128 @@ function normalizeGrid(raw) {
   }
 
 
+  // "elevation" (canonical/current) defaults to the before-state,
+  // since this file has no separate absolute baseline outside the
+  // before/during comparison itself.
+  const elevationField = extractField(raw, [
+    "elevation_before", "elevation", "elevation_grid", "elevationGrid",
+  ]);
+
+  const beforeField = extractField(raw, [
+    "elevation_before", "before", "before_elevation", "before_grid",
+  ]);
+
+  const duringField = extractField(raw, [
+    "elevation_after", "during", "during_elevation", "during_grid",
+  ]);
+
+  const changeField = extractField(raw, [
+    "elevation_change", "change", "difference", "difference_grid", "differenceGrid",
+  ]);
+
+  const confidenceField = extractField(raw, [
+    "combined_confidence", "confidence", "confidence_grid", "confidenceGrid",
+  ]);
+
+  // Genuinely absent from this file type — kept as generic aliases
+  // in case a different NPZ (a single-snapshot analysis file) does
+  // carry these.
+  const slopeField = extractField(raw, [
+    "slope", "slope_grid", "slopeGrid",
+  ]);
+
+  const terrainField = extractField(raw, [
+    "terrain", "terrain_type", "terrain_grid", "terrainGrid",
+  ]);
+
+
+  // Prefer real shape metadata over a hardcoded guess, in this
+  // priority order: explicit raw.rows/cols/width/height, then a
+  // {data, shape} wrapper's own shape, then inference from the
+  // actual array, then finally the hardcoded constant as a last
+  // resort.
+  const explicitShape =
+    elevationField.shape ||
+    beforeField.shape ||
+    duringField.shape ||
+    changeField.shape ||
+    confidenceField.shape ||
+    null;
+
+  // A shape tuple from the NPY header is only usable here if it's
+  // genuinely 2D. A 1D export (e.g. the array was flattened with
+  // .ravel() before saving) has explicitShape.length === 1, which
+  // previously fell through to `explicitShape[1]` -> undefined ->
+  // Number(undefined) -> NaN for cols. Every getGridValue() lookup
+  // then does `row * NaN + col`, which is NaN for every cell, so the
+  // Analysis Map silently paints its "no data" color for the whole
+  // canvas — a black box with no error anywhere. Treat a non-2D
+  // explicit shape as absent and fall through to inference instead.
+  const usableExplicitShape =
+    Array.isArray(explicitShape) && explicitShape.length >= 2
+      ? explicitShape
+      : null;
+
+  if (explicitShape && !usableExplicitShape) {
+    console.warn(
+      "[SASA MINE] Elevation/grid array has a non-2D shape",
+      explicitShape,
+      "— ignoring it and inferring dimensions from the flat data instead."
+    );
+  }
+
+  const inferredShape =
+    usableExplicitShape
+      ? { rows: usableExplicitShape[0], cols: usableExplicitShape[1] }
+      : (
+        inferGridShape(elevationField.data) ||
+        inferGridShape(beforeField.data) ||
+        inferGridShape(duringField.data)
+      );
+
+  if (
+    !raw.rows && !raw.height &&
+    !raw.cols && !raw.width &&
+    inferredShape
+  ) {
+
+    console.log(
+      "[SASA MINE] Grid dimensions not provided explicitly — inferred:",
+      inferredShape
+    );
+  }
+
+
   return {
 
     rows: Number(
       raw.rows ??
       raw.height ??
+      (inferredShape && inferredShape.rows) ??
       GRID_ROWS
     ),
 
     cols: Number(
       raw.cols ??
       raw.width ??
+      (inferredShape && inferredShape.cols) ??
       GRID_COLS
     ),
 
+    elevation: elevationField.data,
+    slope: slopeField.data,
+    terrain: terrainField.data,
+    confidence: confidenceField.data,
+    before: beforeField.data,
+    during: duringField.data,
+    change: changeField.data,
 
-    elevation:
-      raw.elevation ??
-      raw.elevation_grid ??
-      raw.elevationGrid ??
-      null,
-
-
-    slope:
-      raw.slope ??
-      raw.slope_grid ??
-      raw.slopeGrid ??
-      null,
-
-
-    terrain:
-      raw.terrain ??
-      raw.terrain_type ??
-      raw.terrain_grid ??
-      raw.terrainGrid ??
-      null,
-
-
-    confidence:
-      raw.confidence ??
-      raw.confidence_grid ??
-      raw.confidenceGrid ??
-      null,
-
-
-    before:
-      raw.before ??
-      raw.before_elevation ??
-      raw.before_grid ??
-      null,
-
-
-    during:
-      raw.during ??
-      raw.during_elevation ??
-      raw.during_grid ??
-      null,
-
-
-    change:
-      raw.change ??
-      raw.elevation_change ??
-      raw.difference ??
-      raw.difference_grid ??
-      raw.differenceGrid ??
-      null,
+    // Kept for reference even though the current UI schema doesn't
+    // have dedicated rows for these yet — visible via
+    // window.getTerrainData() for debugging, and available to wire
+    // into the UI later if useful.
+    classChanged: extractField(raw, ["class_changed"]).data,
+    significantChange: extractField(raw, ["significant_change"]).data,
   };
 }
 
@@ -2361,6 +2869,67 @@ function loadGridObject(raw) {
       normalizeGrid(
         raw
       );
+
+
+    // Belt-and-suspenders check: even a "valid-looking" 2D shape can
+    // disagree with the actual flat array length (e.g. the shape
+    // tuple describes a different array than the one that got
+    // exported). If rows*cols doesn't match elevation.length, every
+    // getGridValue() lookup past the true end of the data silently
+    // returns null, which is exactly what makes the Analysis Map
+    // render as a plain black box with no thrown error to notice.
+    // Log it loudly so a mismatch is obvious in the console instead
+    // of only showing up as "the map looks empty."
+    if (
+      terrainData.elevation &&
+      terrainData.rows * terrainData.cols !== terrainData.elevation.length
+    ) {
+
+      console.warn(
+        "[SASA MINE] Grid dimension mismatch:",
+        `rows(${terrainData.rows}) x cols(${terrainData.cols}) =`,
+        terrainData.rows * terrainData.cols,
+        `but elevation array has ${terrainData.elevation.length} values.`,
+        "Analysis Map / Terrain Inspection lookups will be wrong or blank for this file."
+      );
+
+      const squareGuess = inferGridShape(terrainData.elevation);
+
+      if (squareGuess) {
+
+        console.warn(
+          "[SASA MINE] Falling back to inferred square dimensions:",
+          squareGuess
+        );
+
+        terrainData.rows = squareGuess.rows;
+        terrainData.cols = squareGuess.cols;
+      }
+    }
+
+
+    // The analysis NPZ this pipeline currently exports has no slope
+    // field at all (see the comment on normalizeGrid) — that's not
+    // something loading a GLB can fix, since the GLB only carries
+    // 3D shape, not per-point analysis values. Rather than leaving
+    // Slope Heatmap permanently disabled and Terrain Inspection's
+    // Slope/Terrain Type rows permanently blank, derive slope
+    // directly from the elevation grid itself whenever the file
+    // doesn't supply it.
+    if (!terrainData.slope && terrainData.elevation) {
+
+      terrainData.slope = computeSlopeGrid(
+        terrainData.elevation,
+        terrainData.rows,
+        terrainData.cols
+      );
+
+      terrainData.slopeIsEstimated = true;
+
+      console.log(
+        "[SASA MINE] No slope field in analysis file — computed slope from elevation grid instead."
+      );
+    }
 
 
     gridLoaded = true;
@@ -2401,6 +2970,28 @@ function loadGridObject(raw) {
 
 
     updateElevationPanels();
+
+
+    // Paint the 2D top-down elevation map now that real data exists.
+    // (This call was missing entirely before — the canvas element
+    // existed but nothing ever drew to it, which is why it only ever
+    // showed as a blank black box.)
+    drawAnalysisMap();
+
+
+    // Recolor the terrain now that real elevation data is available
+    // (covers the case where the GLB finished loading before the
+    // grid did).
+    applySlopeHeatmapState();
+
+
+    // Visibly grey out Slope Heatmap when this file has no slope
+    // data, rather than letting it silently do nothing on click.
+    const hasSlope = !!terrainData.slope;
+
+    [btnSlopeHeatmap, btnToolbarSlopeHeatmap].forEach((button) => {
+      button?.classList.toggle("is-disabled", !hasSlope);
+    });
 
 
     setStatus(
@@ -2590,6 +3181,41 @@ function getTerrainDataAt(
     terrainData.cols;
 
 
+  const slopeValue =
+    getGridValue(
+      terrainData.slope,
+      row,
+      col,
+      cols
+    );
+
+
+  const rawTerrain =
+    getGridValue(
+      terrainData.terrain,
+      row,
+      col,
+      cols
+    );
+
+
+  // Real pipeline-provided terrain classification always wins. Only
+  // fall back to a slope-derived estimate when the file has none —
+  // and label it clearly as an estimate, never presented as if it
+  // came from the pipeline.
+  const terrainLabel =
+    (rawTerrain !== null && rawTerrain !== undefined)
+      ? rawTerrain
+      : (
+        typeof slopeValue === "number"
+          ? (() => {
+              const label = deriveTerrainTypeLabel(slopeValue);
+              return label ? `${label} (est.)` : null;
+            })()
+          : null
+      );
+
+
   return {
 
     elevation:
@@ -2601,20 +3227,10 @@ function getTerrainDataAt(
       ),
 
     slope:
-      getGridValue(
-        terrainData.slope,
-        row,
-        col,
-        cols
-      ),
+      slopeValue,
 
     terrain:
-      getGridValue(
-        terrainData.terrain,
-        row,
-        col,
-        cols
-      ),
+      terrainLabel,
 
     confidence:
       getGridValue(
@@ -2668,10 +3284,9 @@ function worldToGrid(
     worldPoint.clone();
 
 
-  // Undo root translation + rotation.
-  activeModel.root.worldToLocal(
-    local
-  );
+  // Convert the world-space raycast point into the GLB's local coordinates.
+  // The model is not rotated, so X/Y remain the terrain plane.
+  activeModel.root.worldToLocal(local);
 
 
   const meshCols =
@@ -2688,23 +3303,19 @@ function worldToGrid(
 
 
   // Person 3 coordinate convention:
-  //
-  // X = column
-  // Y = -row
+  // X = column - 255.5
+  // Y = -(row - 255.5)
   // Z = elevation
   //
-  // After root rotation:
-  // local coordinates are recovered here.
-
+  // Therefore the inverse is:
+  // meshCol = X + 255.5
+  // meshRow = 255.5 - Y
 
   const meshColFloat =
-    local.x +
-    (meshCols - 1) / 2;
-
+    local.x + (meshCols - 1) / 2;
 
   const meshRowFloat =
-    -local.y +
-    (meshRows - 1) / 2;
+    -local.y + (meshRows - 1) / 2;
 
 
   const meshCol =
@@ -2730,13 +3341,6 @@ function worldToGrid(
   }
 
 
-  const row =
-    meshRow * step;
-
-  const col =
-    meshCol * step;
-
-
   const gridRows =
     activeModel.gridRows ||
     GRID_ROWS;
@@ -2744,6 +3348,18 @@ function worldToGrid(
   const gridCols =
     activeModel.gridCols ||
     GRID_COLS;
+
+  // Map the 512x512 mesh to the full-resolution analysis grid.
+  // Use the complete endpoint range so 511 maps to 1023.
+  const row =
+    Math.round(
+      meshRow * (gridRows - 1) / (meshRows - 1)
+    );
+
+  const col =
+    Math.round(
+      meshCol * (gridCols - 1) / (meshCols - 1)
+    );
 
 
   if (
@@ -2872,8 +3488,10 @@ renderer.domElement.addEventListener(
     pointerDown = null;
 
 
-    // Ignore orbit dragging.
-    if (distance > 8) {
+    // Ignore orbit dragging. Threshold raised from 8px — trackpads
+    // commonly jitter past a tight threshold and get misread as a
+    // drag, which silently swallows the click with zero feedback.
+    if (distance > 14) {
       return;
     }
 
@@ -2965,7 +3583,7 @@ renderer.domElement.addEventListener(
 
         viewportCursorAltEl.textContent =
           formatValue(
-            worldPoint.y,
+            worldPoint.z,
             " rel"
           );
       }
@@ -2976,7 +3594,7 @@ renderer.domElement.addEventListener(
 
       viewportCursorAltEl.textContent =
         formatValue(
-          worldPoint.y,
+          worldPoint.z,
           " rel"
         );
     }
@@ -3022,6 +3640,12 @@ function inspectTerrain(
 
 
   if (!hits.length) {
+
+    setStatus(
+      "No terrain surface at that point — click directly on the visible mesh.",
+      true
+    );
+
     return;
   }
 
@@ -3091,6 +3715,15 @@ function showInspection(
   }
 
 
+  if (
+    typeof data.row === "number" &&
+    typeof data.col === "number"
+  ) {
+
+    updateAnalysisMapMarker(data.row, data.col);
+  }
+
+
   inspectionPanelEl.classList.add(
     "has-selection"
   );
@@ -3145,8 +3778,10 @@ function showInspection(
 
   set(
     inspectionTerrainTypeEl,
-    data.terrain ??
-    "---"
+    data.terrain !== null &&
+      data.terrain !== undefined
+      ? String(data.terrain)
+      : "---"
   );
 
 
@@ -3225,6 +3860,318 @@ function clearInspection() {
 
   terrainMarkerEl?.classList.remove(
     "is-visible"
+  );
+}
+
+
+// ============================================================================
+// ANALYSIS MAP — 2D top-down elevation raster
+// Rebuilt per request: a flat colored view of the same elevation grid
+// the 3D terrain uses, with a marker for the last 3D click, and a
+// draggable rectangle for region selection (see Region Analysis below).
+// Reuses the same rainbow ramp as the Elevation Color 3D toggle for
+// visual consistency between the two views.
+// ============================================================================
+
+function drawAnalysisMap() {
+
+  if (!analysisMapCanvasEl) {
+    return;
+  }
+
+  const hasData = gridLoaded && terrainData?.elevation;
+
+  analysisMapCardEl?.classList.toggle("is-empty", !hasData);
+
+  if (!hasData) {
+    return;
+  }
+
+  const rows = terrainData.rows;
+  const cols = terrainData.cols;
+
+  const range = scanGridRange(terrainData.elevation);
+
+  if (!range) {
+    analysisMapCardEl?.classList.add("is-empty");
+    return;
+  }
+
+  // Diagnostic: if this ever prints a low "valid" count relative to
+  // total, the canvas will look like a black/near-black box even
+  // though hasData was true — that means row/col math or the grid's
+  // dimensions don't line up with the actual data, not that the map
+  // "isn't working" in general. Cheap to compute once per draw.
+  {
+    let validCount = 0;
+
+    for (let i = 0; i < terrainData.elevation.length; i++) {
+      if (Number.isFinite(terrainData.elevation[i])) validCount++;
+    }
+
+    console.log(
+      "[SASA MINE] Analysis Map draw:",
+      `${rows} x ${cols} grid,`,
+      `${terrainData.elevation.length} elevation values,`,
+      `${validCount} finite,`,
+      `range ${range.min.toFixed(2)}..${range.max.toFixed(2)}`
+    );
+  }
+
+  analysisMapCanvasEl.width = cols;
+  analysisMapCanvasEl.height = rows;
+
+  const ctx = analysisMapCanvasEl.getContext("2d");
+  const imageData = ctx.createImageData(cols, rows);
+  const span = range.max - range.min || 1;
+  const color = new THREE.Color();
+
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+
+      const value = getGridValue(terrainData.elevation, row, col, cols);
+      const pixelIndex = (row * cols + col) * 4;
+
+      if (typeof value === "number") {
+
+        const t = Math.min(Math.max((value - range.min) / span, 0), 1);
+        // Same rainbow ramp as the 3D Elevation Color toggle.
+        color.setHSL(0.66 - t * 0.66, 0.75, 0.5);
+
+        imageData.data[pixelIndex] = Math.round(color.r * 255);
+        imageData.data[pixelIndex + 1] = Math.round(color.g * 255);
+        imageData.data[pixelIndex + 2] = Math.round(color.b * 255);
+        imageData.data[pixelIndex + 3] = 255;
+
+      } else {
+
+        imageData.data[pixelIndex] = 20;
+        imageData.data[pixelIndex + 1] = 22;
+        imageData.data[pixelIndex + 2] = 20;
+        imageData.data[pixelIndex + 3] = 255;
+      }
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+}
+
+
+function updateAnalysisMapMarker(row, col) {
+
+  if (!analysisMapMarkerEl || !gridLoaded || !terrainData) {
+    return;
+  }
+
+  const rows = terrainData.rows;
+  const cols = terrainData.cols;
+
+  const leftPct = (col / (cols - 1)) * 100;
+  const topPct = (row / (rows - 1)) * 100;
+
+  analysisMapMarkerEl.style.left = `${leftPct}%`;
+  analysisMapMarkerEl.style.top = `${topPct}%`;
+  analysisMapMarkerEl.classList.add("is-visible");
+}
+
+
+// ---- Region select: map a mouse event on the map to a grid cell ----
+
+function mapEventToGridCell(event) {
+
+  if (!analysisMapEl || !gridLoaded || !terrainData) {
+    return null;
+  }
+
+  const rect = analysisMapEl.getBoundingClientRect();
+
+  const xPct = Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1);
+  const yPct = Math.min(Math.max((event.clientY - rect.top) / rect.height, 0), 1);
+
+  const col = Math.round(xPct * (terrainData.cols - 1));
+  const row = Math.round(yPct * (terrainData.rows - 1));
+
+  return { row, col, xPct, yPct };
+}
+
+
+let regionDragStart = null;
+
+analysisMapEl?.addEventListener("pointerdown", (event) => {
+
+  // Belt-and-suspenders: CSS already sets touch-action:none on
+  // #analysis-map so a drag here shouldn't be read as a page
+  // gesture, but calling preventDefault directly stops any browser
+  // default (text selection, image-drag ghost, etc.) from starting
+  // on the very first pointerdown, before CSS touch-action even has
+  // a chance to apply on some browsers.
+  event.preventDefault();
+
+  const cell = mapEventToGridCell(event);
+
+  if (!cell) {
+    return;
+  }
+
+  regionDragStart = cell;
+
+  if (analysisMapSelectionEl) {
+    analysisMapSelectionEl.classList.add("is-visible");
+    analysisMapSelectionEl.style.left = `${cell.xPct * 100}%`;
+    analysisMapSelectionEl.style.top = `${cell.yPct * 100}%`;
+    analysisMapSelectionEl.style.width = "0%";
+    analysisMapSelectionEl.style.height = "0%";
+  }
+
+  analysisMapEl.setPointerCapture?.(event.pointerId);
+});
+
+
+analysisMapEl?.addEventListener("pointermove", (event) => {
+
+  if (!regionDragStart || !analysisMapSelectionEl) {
+    return;
+  }
+
+  const cell = mapEventToGridCell(event);
+
+  if (!cell) {
+    return;
+  }
+
+  const left = Math.min(regionDragStart.xPct, cell.xPct) * 100;
+  const top = Math.min(regionDragStart.yPct, cell.yPct) * 100;
+  const width = Math.abs(cell.xPct - regionDragStart.xPct) * 100;
+  const height = Math.abs(cell.yPct - regionDragStart.yPct) * 100;
+
+  analysisMapSelectionEl.style.left = `${left}%`;
+  analysisMapSelectionEl.style.top = `${top}%`;
+  analysisMapSelectionEl.style.width = `${width}%`;
+  analysisMapSelectionEl.style.height = `${height}%`;
+});
+
+
+analysisMapEl?.addEventListener("pointerup", (event) => {
+
+  if (!regionDragStart) {
+    return;
+  }
+
+  const cell = mapEventToGridCell(event);
+  const start = regionDragStart;
+  regionDragStart = null;
+
+  if (!cell) {
+    return;
+  }
+
+  const rowMin = Math.min(start.row, cell.row);
+  const rowMax = Math.max(start.row, cell.row);
+  const colMin = Math.min(start.col, cell.col);
+  const colMax = Math.max(start.col, cell.col);
+
+  // Treat a near-zero drag as a click, not a region — clears the
+  // selection rather than reporting a meaningless 1-point region.
+  if (rowMax - rowMin < 2 && colMax - colMin < 2) {
+
+    clearRegionSelection();
+    return;
+  }
+
+  computeRegionStats(rowMin, rowMax, colMin, colMax);
+});
+
+
+function clearRegionSelection() {
+
+  regionPanelEl?.classList.remove("has-selection");
+  analysisMapSelectionEl?.classList.remove("is-visible");
+}
+
+
+// ---- Region Analysis: aggregate stats over a rectangular selection ----
+
+function computeRegionStats(rowMin, rowMax, colMin, colMax) {
+
+  if (!gridLoaded || !terrainData || !regionPanelEl) {
+    return;
+  }
+
+  const cols = terrainData.cols;
+
+  let count = 0;
+  let changeSum = 0;
+  let changeMin = Infinity;
+  let changeMax = -Infinity;
+  let elevationSum = 0;
+  let elevationCount = 0;
+  let significantCount = 0;
+
+  for (let row = rowMin; row <= rowMax; row++) {
+    for (let col = colMin; col <= colMax; col++) {
+
+      const changeValue = getGridValue(terrainData.change, row, col, cols);
+      const elevationValue = getGridValue(terrainData.elevation, row, col, cols);
+      const significantValue = getGridValue(terrainData.significantChange, row, col, cols);
+
+      if (typeof changeValue === "number") {
+
+        count++;
+        changeSum += changeValue;
+        changeMin = Math.min(changeMin, changeValue);
+        changeMax = Math.max(changeMax, changeValue);
+      }
+
+      if (typeof elevationValue === "number") {
+
+        elevationSum += elevationValue;
+        elevationCount++;
+      }
+
+      if (significantValue === true || significantValue === 1) {
+        significantCount++;
+      }
+    }
+  }
+
+  regionPanelEl.classList.add("has-selection");
+
+  if (regionCountEl) {
+    regionCountEl.textContent = String(count);
+  }
+
+  if (regionAvgChangeEl) {
+    regionAvgChangeEl.textContent = count > 0
+      ? formatValue(changeSum / count, " m")
+      : "---";
+  }
+
+  if (regionMinMaxChangeEl) {
+    regionMinMaxChangeEl.textContent = count > 0
+      ? `${formatValue(changeMin, " m")} / ${formatValue(changeMax, " m")}`
+      : "---";
+  }
+
+  if (regionAvgElevationEl) {
+    regionAvgElevationEl.textContent = elevationCount > 0
+      ? formatValue(elevationSum / elevationCount, " m")
+      : "---";
+  }
+
+  if (regionSignificantCountEl) {
+    regionSignificantCountEl.textContent =
+      typeof terrainData.significantChange !== "undefined" && terrainData.significantChange !== null
+        ? String(significantCount)
+        : "Not available";
+  }
+
+  setStatus(
+    `Region selected: ${count} points (rows ${rowMin}-${rowMax}, cols ${colMin}-${colMax})`
+  );
+
+  console.log(
+    "[SASA MINE] REGION ANALYSIS",
+    { rowMin, rowMax, colMin, colMax, count, avgChange: count > 0 ? changeSum / count : null }
   );
 }
 
@@ -3430,6 +4377,146 @@ function setHillshade(
 
 
 // ============================================================================
+// SHARED: COLOR MESH VERTICES FROM A GRID FIELD
+// Both slope heatmap and elevation coloring use this same proven
+// mesh-vertex-to-grid-index mapping.
+// ============================================================================
+
+function colorMeshFromGrid(grid, range, colorFn) {
+
+  if (!activeModel || !grid || !range) {
+    return false;
+  }
+
+  const span = range.max - range.min || 1;
+
+  activeModel.root.traverse((object) => {
+
+    if (!object.isMesh || !object.geometry?.attributes?.position) {
+      return;
+    }
+
+    const geometry = object.geometry;
+    const positions = geometry.attributes.position;
+    const colors = new Float32Array(positions.count * 3);
+    const color = new THREE.Color();
+
+    for (let i = 0; i < positions.count; i++) {
+
+      const x = positions.getX(i);
+      const y = positions.getY(i);
+
+      const meshCol = Math.round(x + (activeModel.meshCols - 1) / 2);
+      const meshRow = Math.round(-y + (activeModel.meshRows - 1) / 2);
+
+      let value = null;
+
+      if (
+        meshRow >= 0 && meshRow < activeModel.meshRows &&
+        meshCol >= 0 && meshCol < activeModel.meshCols
+      ) {
+
+        const gridRows = terrainData.rows;
+        const gridCols = terrainData.cols;
+
+        const row = Math.round(meshRow * (gridRows - 1) / (activeModel.meshRows - 1));
+        const col = Math.round(meshCol * (gridCols - 1) / (activeModel.meshCols - 1));
+
+        value = getGridValue(grid, row, col, terrainData.cols);
+      }
+
+      if (typeof value === "number") {
+
+        const t = Math.min(Math.max((value - range.min) / span, 0), 1);
+        colorFn(color, t);
+
+      } else {
+
+        color.setRGB(0.35, 0.37, 0.4);
+      }
+
+      colors[i * 3] = color.r;
+      colors[i * 3 + 1] = color.g;
+      colors[i * 3 + 2] = color.b;
+    }
+
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+    const materials = Array.isArray(object.material) ? object.material : [object.material];
+
+    materials.forEach((material) => {
+      if (material) {
+        material.vertexColors = true;
+        material.needsUpdate = true;
+      }
+    });
+  });
+
+  return true;
+}
+
+
+// ============================================================================
+// ELEVATION COLORING — now an explicit opt-in toggle (Elevation Color
+// button), not the default view. Full rainbow ramp — blue (low) ->
+// cyan -> green -> yellow -> red (high) — matching the reference
+// point-cloud coloring the person asked for, not a muted green-red tint.
+// ============================================================================
+
+function applyElevationColorState() {
+
+  if (!activeModel || !gridLoaded || !terrainData?.elevation) {
+    return false;
+  }
+
+  const range = scanGridRange(terrainData.elevation);
+
+  if (!range) {
+    return false;
+  }
+
+  return colorMeshFromGrid(terrainData.elevation, range, (color, t) => {
+    // hue 0.66 (blue) down to 0 (red) — matches the CSS legend ramp.
+    color.setHSL(0.66 - t * 0.66, 0.75, 0.5);
+  });
+}
+
+
+// ============================================================================
+// SHADING DISPATCHER
+// Only one coloring mode is visually active at a time. Default (both
+// off) is the plain textured look — coloring is opt-in per the
+// person's explicit request, not applied automatically on load.
+// ============================================================================
+
+function applyShadingMode() {
+
+  if (!activeModel) {
+    return;
+  }
+
+  let colored = false;
+
+  if (slopeHeatmapOn) {
+
+    colored = applySlopeColorState();
+
+  } else if (elevationColorOn) {
+
+    colored = applyElevationColorState();
+  }
+
+  if (!colored) {
+
+    forEachMeshMaterial((material) => {
+      material.vertexColors = false;
+      material.needsUpdate = true;
+    });
+  }
+}
+
+
+// ============================================================================
 // SLOPE RANGE
 // ============================================================================
 
@@ -3459,254 +4546,36 @@ function computeSlopeRange() {
 // SLOPE HEATMAP
 // ============================================================================
 
-function applySlopeHeatmapState() {
+function applySlopeColorState() {
 
-  if (!activeModel) {
-    return;
-  }
-
-
-  if (!slopeHeatmapOn) {
-
-    forEachMeshMaterial(
-      (material) => {
-
-        material.vertexColors =
-          false;
-
-        material.needsUpdate =
-          true;
-      }
-    );
-
-    return;
-  }
-
-
-  const range =
-    computeSlopeRange();
-
+  const range = computeSlopeRange();
 
   if (!range) {
 
-    slopeHeatmapOn =
-      false;
+    slopeHeatmapOn = false;
 
-
-    [
-      btnSlopeHeatmap,
-      btnToolbarSlopeHeatmap,
-    ].forEach(
-      (button) =>
-        button?.classList.remove(
-          "is-active"
-        )
+    [btnSlopeHeatmap, btnToolbarSlopeHeatmap].forEach((button) =>
+      button?.classList.remove("is-active")
     );
 
-
-    setStatus(
-      "Slope data unavailable.",
-      true
-    );
-
-    return;
+    setStatus("Slope data unavailable.", true);
+    return false;
   }
 
-
-  const span =
-    range.max -
-    range.min ||
-    1;
-
-
-  activeModel.root.traverse(
-    (object) => {
-
-      if (
-        !object.isMesh ||
-        !object.geometry?.attributes
-          ?.position
-      ) {
-
-        return;
-      }
+  return colorMeshFromGrid(terrainData.slope, range, (color, t) => {
+    // Blue -> cyan -> yellow -> red
+    color.setHSL(0.62 - t * 0.62, 0.75, 0.5);
+  });
+}
 
 
-      const geometry =
-        object.geometry;
+function applySlopeHeatmapState() {
 
+  applyShadingMode();
 
-      const positions =
-        geometry.attributes.position;
-
-
-      const colors =
-        new Float32Array(
-          positions.count * 3
-        );
-
-
-      const color =
-        new THREE.Color();
-
-
-      for (
-        let i = 0;
-        i < positions.count;
-        i++
-      ) {
-
-        const x =
-          positions.getX(i);
-
-        const y =
-          positions.getY(i);
-
-
-        const meshCol =
-          Math.round(
-            x +
-            (
-              activeModel.meshCols -
-              1
-            ) /
-            2
-          );
-
-
-        const meshRow =
-          Math.round(
-            -y +
-            (
-              activeModel.meshRows -
-              1
-            ) /
-            2
-          );
-
-
-        let value =
-          null;
-
-
-        if (
-          meshRow >= 0 &&
-          meshRow <
-          activeModel.meshRows &&
-          meshCol >= 0 &&
-          meshCol <
-          activeModel.meshCols
-        ) {
-
-          const row =
-            meshRow *
-            activeModel.samplingStep;
-
-          const col =
-            meshCol *
-            activeModel.samplingStep;
-
-
-          value =
-            getGridValue(
-              terrainData.slope,
-              row,
-              col,
-              terrainData.cols
-            );
-        }
-
-
-        if (
-          typeof value ===
-          "number"
-        ) {
-
-          const t =
-            Math.min(
-              Math.max(
-                (
-                  value -
-                  range.min
-                ) /
-                span,
-                0
-              ),
-              1
-            );
-
-
-          // Blue -> cyan -> yellow -> red
-          color.setHSL(
-            0.62 -
-            t * 0.62,
-            0.75,
-            0.5
-          );
-
-        }
-
-        else {
-
-          color.setRGB(
-            0.35,
-            0.37,
-            0.4
-          );
-        }
-
-
-        colors[i * 3] =
-          color.r;
-
-        colors[i * 3 + 1] =
-          color.g;
-
-        colors[i * 3 + 2] =
-          color.b;
-      }
-
-
-      geometry.setAttribute(
-        "color",
-        new THREE.BufferAttribute(
-          colors,
-          3
-        )
-      );
-
-
-      const materials =
-        Array.isArray(
-          object.material
-        )
-          ? object.material
-          : [object.material];
-
-
-      materials.forEach(
-        (material) => {
-
-          if (!material) {
-            return;
-          }
-
-
-          material.vertexColors =
-            true;
-
-          material.needsUpdate =
-            true;
-        }
-      );
-
-    }
-  );
-
-
-  setStatus(
-    "Slope heatmap enabled"
-  );
+  if (slopeHeatmapOn) {
+    setStatus("Slope heatmap enabled");
+  }
 }
 
 
@@ -3717,7 +4586,50 @@ function setSlopeHeatmap(
   slopeHeatmapOn =
     on;
 
+  if (on && elevationColorOn) {
+
+    elevationColorOn = false;
+
+    [btnElevationColor].forEach((button) =>
+      button?.classList.remove("is-active")
+    );
+  }
+
   applySlopeHeatmapState();
+}
+
+
+function setElevationColor(on) {
+
+  if (!activeModel || !gridLoaded || !terrainData?.elevation) {
+
+    setStatus(
+      "Load grid data containing elevation values first.",
+      true
+    );
+
+    [btnElevationColor].forEach((button) =>
+      button?.classList.remove("is-active")
+    );
+
+    elevationColorOn = false;
+    return;
+  }
+
+  elevationColorOn = on;
+
+  if (on && slopeHeatmapOn) {
+
+    slopeHeatmapOn = false;
+
+    [btnSlopeHeatmap, btnToolbarSlopeHeatmap].forEach((button) =>
+      button?.classList.remove("is-active")
+    );
+  }
+
+  applyShadingMode();
+
+  setStatus(on ? "Elevation color enabled" : "Elevation color disabled");
 }
 
 
@@ -3837,6 +4749,14 @@ wireLinkedToggle(
 );
 
 
+btnElevationColor?.addEventListener("click", () => {
+
+  const nextState = !elevationColorOn;
+  setElevationColor(nextState);
+  btnElevationColor.classList.toggle("is-active", elevationColorOn);
+});
+
+
 // ============================================================================
 // TERRAIN TEXTURE / RESET SHADING
 // ============================================================================
@@ -3846,13 +4766,14 @@ function resetShading() {
   wireframeOn = false;
   hillshadeOn = false;
   slopeHeatmapOn = false;
+  elevationColorOn = false;
 
 
   applyWireframeState();
 
   setHillshade(false);
 
-  applySlopeHeatmapState();
+  applyShadingMode();
 
 
   [
@@ -3862,6 +4783,7 @@ function resetShading() {
     btnToolbarHillshade,
     btnSlopeHeatmap,
     btnToolbarSlopeHeatmap,
+    btnElevationColor,
   ].forEach(
     (button) =>
       button?.classList.remove(
@@ -3936,9 +4858,8 @@ function applyZExaggeration() {
   }
 
 
-  // IMPORTANT:
-  // Person 3 elevation axis is authored Z.
-  // Therefore scale local Z before/through the Z-up -> Y-up rotation.
+  // Person 3 elevation axis is Z.
+  // Scale only Z. X/Y ground coordinates remain unchanged.
   activeModel.root.scale.z =
     zExaggeration;
 
@@ -4096,6 +5017,257 @@ updateSliderFill(
 
 
 // ============================================================================
+// BEFORE / AFTER TERRAIN COMPARISON
+//
+// Person 3 now provides two GLBs of the same site — before mining
+// activity and after. Both are exported from the same pipeline, so
+// their meshes are expected to share identical vertex counts/order;
+// that lets us morph vertex positions directly instead of merely
+// crossfading two overlapping models (which would look like a double
+// exposure rather than the ground actually changing shape).
+//
+// The After model is what loadGLBFromURL() already loads as
+// activeModel via the normal path (camera framing, shading, click
+// inspection — all untouched). This section loads the Before model
+// separately, off-scene, purely to read its vertex positions.
+// ============================================================================
+
+function clearComparisonState() {
+
+  comparisonEntries = [];
+  comparisonReady = false;
+  comparisonT = comparisonSliderEl
+    ? Number(comparisonSliderEl.value) / 100
+    : 1;
+
+  comparisonDockEl?.classList.add("is-hidden");
+}
+
+
+// Loads a GLB purely to read its geometry, without touching the scene,
+// activeModel, camera, or any of the existing single-model UI state.
+function loadGLBGeometryOnly(url) {
+
+  return new Promise((resolve, reject) => {
+
+    if (!url) {
+      reject(new Error("No GLB URL"));
+      return;
+    }
+
+    loader.load(
+      url,
+      (gltf) => resolve(gltf.scene),
+      undefined,
+      (error) => reject(error)
+    );
+  });
+}
+
+
+// Walks a root in traversal order and returns one entry per mesh with
+// a position attribute — the same order prepareModel()/frameModel()
+// rely on implicitly, and the same order Person 3's exporter uses
+// consistently across a before/after pair from the same pipeline.
+function collectMeshPositionArrays(root) {
+
+  const entries = [];
+
+  root.traverse((object) => {
+
+    if (!object.isMesh || !object.geometry?.attributes?.position) {
+      return;
+    }
+
+    entries.push({
+      mesh: object,
+      positions: object.geometry.attributes.position,
+    });
+  });
+
+  return entries;
+}
+
+
+async function loadComparisonPair(afterRoot, beforeUrl) {
+
+  if (!beforeUrl || !afterRoot) {
+    return;
+  }
+
+  try {
+
+    setStatus("Loading before/after comparison model...");
+
+    const beforeRoot = await loadGLBGeometryOnly(beforeUrl);
+
+    const afterMeshes = collectMeshPositionArrays(afterRoot);
+    const beforeMeshes = collectMeshPositionArrays(beforeRoot);
+
+    if (!afterMeshes.length || !beforeMeshes.length) {
+
+      throw new Error(
+        "Before/After comparison: one of the models has no mesh geometry."
+      );
+    }
+
+    if (afterMeshes.length !== beforeMeshes.length) {
+
+      throw new Error(
+        `Before/After comparison: mesh count differs (After has ${afterMeshes.length}, Before has ${beforeMeshes.length}).`
+      );
+    }
+
+    const entries = [];
+
+    for (let i = 0; i < afterMeshes.length; i++) {
+
+      const afterEntry = afterMeshes[i];
+      const beforeEntry = beforeMeshes[i];
+
+      if (afterEntry.positions.count !== beforeEntry.positions.count) {
+
+        throw new Error(
+          `Before/After comparison: vertex count differs on mesh ${i} (After has ${afterEntry.positions.count}, Before has ${beforeEntry.positions.count}). The two GLBs likely came from different mesh resolutions.`
+        );
+      }
+
+      // Snapshot both buffers now, independent of the live geometry —
+      // the live "after" attribute gets overwritten as the slider
+      // moves, so we can't re-read it from the mesh once dragging
+      // starts.
+      entries.push({
+        mesh: afterEntry.mesh,
+        afterPositions: Float32Array.from(afterEntry.positions.array),
+        beforePositions: Float32Array.from(beforeEntry.positions.array),
+      });
+    }
+
+    // The before-only scene graph is never added to the renderer and
+    // isn't needed once its position data has been copied out.
+    beforeRoot.traverse((object) => {
+      if (object.isMesh) {
+        object.geometry?.dispose();
+      }
+    });
+
+    comparisonEntries = entries;
+    comparisonReady = true;
+
+    comparisonDockEl?.classList.remove("is-hidden");
+
+    if (comparisonSliderEl) {
+      comparisonT = Number(comparisonSliderEl.value) / 100;
+    }
+
+    applyComparisonT(comparisonT, { recomputeFraming: false });
+
+    setStatus("Before/After comparison ready — drag the slider over the viewport.");
+
+  } catch (error) {
+
+    console.error("[SASA MINE] Before/After comparison unavailable:", error);
+
+    comparisonEntries = [];
+    comparisonReady = false;
+
+    comparisonDockEl?.classList.add("is-hidden");
+
+    setStatus(
+      `Before/After comparison unavailable: ${error.message}`,
+      true
+    );
+  }
+}
+
+
+// Re-derives every paired mesh's position attribute from the original
+// Before/After snapshots (never lerping into an already-lerped
+// buffer), so scrubbing the slider back and forth stays exact instead
+// of drifting.
+function applyComparisonT(t, { recomputeFraming = true } = {}) {
+
+  if (!comparisonReady || !comparisonEntries.length) {
+    return;
+  }
+
+  const clampedT = Math.min(Math.max(t, 0), 1);
+
+  comparisonEntries.forEach(({ mesh, beforePositions, afterPositions }) => {
+
+    const attribute = mesh.geometry.attributes.position;
+    const array = attribute.array;
+
+    for (let i = 0; i < array.length; i++) {
+
+      array[i] =
+        beforePositions[i] +
+        (afterPositions[i] - beforePositions[i]) * clampedT;
+    }
+
+    attribute.needsUpdate = true;
+
+    mesh.geometry.computeVertexNormals();
+    mesh.geometry.computeBoundingBox();
+    mesh.geometry.computeBoundingSphere();
+  });
+
+  comparisonT = clampedT;
+
+  if (comparisonValueEl) {
+
+    comparisonValueEl.textContent =
+      `${Math.round(clampedT * 100)}%`;
+  }
+
+  // Recompute the overall model bounds/center so lighting and (if the
+  // person resets the camera) framing follow the currently displayed
+  // shape rather than staying pinned to wherever the After model's
+  // bounds originally were. Skipped during the very first application
+  // (right after load) since frameModel() already ran once for the
+  // After model and re-framing here would fight the person's camera.
+  if (recomputeFraming && activeModel) {
+
+    const box = new THREE.Box3().setFromObject(activeModel.root);
+
+    activeModel.size = box.getSize(new THREE.Vector3());
+    activeModel.center = box.getCenter(new THREE.Vector3());
+
+    sun.target.position.copy(activeModel.center);
+    sun.target.updateMatrixWorld();
+
+    applySolarPosition();
+
+    updateElevationPanels();
+  }
+}
+
+
+// Slider drags fire many "input" events per second — recomputing
+// normals for a 512x512-ish mesh on every single one is wasted work
+// the browser can't keep up with. Collapse to at most one update per
+// animation frame.
+comparisonSliderEl?.addEventListener("input", () => {
+
+  const t = Number(comparisonSliderEl.value) / 100;
+
+  comparisonT = t;
+
+  if (comparisonUpdatePending) {
+    return;
+  }
+
+  comparisonUpdatePending = true;
+
+  requestAnimationFrame(() => {
+
+    comparisonUpdatePending = false;
+    applyComparisonT(comparisonT);
+  });
+});
+
+
+// ============================================================================
 // FLYTHROUGH PATH
 // ============================================================================
 
@@ -4103,100 +5275,43 @@ function createFlyPath(
   model
 ) {
 
-  const {
-    size,
-    center,
-  } = model;
+  const { size, center } = model;
 
-
-  const width =
-    Math.max(
-      size.x,
-      size.z
-    );
-
-
-  const height =
-    Math.max(
-      size.y,
-      width * 0.12,
-      20
-    );
-
+  const width = Math.max(size.x, size.y);
+  const height = Math.max(size.z, width * 0.12, 20);
 
   const points = [
-
-    // High starting shot
     new THREE.Vector3(
-      center.x +
-      width * 0.95,
-
-      center.y +
-      height * 1.8,
-
-      center.z +
-      width * 0.95
+      center.x + width * 0.95,
+      center.y + width * 0.75,
+      center.z + height * 1.8
     ),
-
-    // Descend
     new THREE.Vector3(
-      center.x +
-      width * 0.6,
-
-      center.y +
-      height * 1.15,
-
-      center.z +
-      width * 0.35
+      center.x + width * 0.6,
+      center.y + width * 0.45,
+      center.z + height * 1.15
     ),
-
-    // Move toward terrain
     new THREE.Vector3(
-      center.x +
-      width * 0.3,
-
-      center.y +
-      height * 0.7,
-
-      center.z
+      center.x + width * 0.3,
+      center.y + width * 0.25,
+      center.z + height * 0.7
     ),
-
-    // Low cinematic pass
     new THREE.Vector3(
       center.x,
-
-      center.y +
-      height * 0.45,
-
-      center.z -
-      width * 0.15
+      center.y + width * 0.2,
+      center.z + height * 0.45
     ),
-
-    // Across terrain
     new THREE.Vector3(
-      center.x -
-      width * 0.45,
-
-      center.y +
-      height * 0.3,
-
-      center.z -
-      width * 0.25
+      center.x - width * 0.45,
+      center.y - width * 0.15,
+      center.z + height * 0.3
     ),
-
-    // Final rising shot
     new THREE.Vector3(
-      center.x -
-      width * 0.25,
-
-      center.y +
-      height * 0.45,
-
-      center.z +
-      width * 0.35
+      center.x - width * 0.25,
+      center.y - width * 0.05,
+      center.z + height * 0.45
     ),
   ];
-
 
   return new THREE.CatmullRomCurve3(
     points,
@@ -4205,7 +5320,6 @@ function createFlyPath(
     0.5
   );
 }
-
 
 // ============================================================================
 // START FLYTHROUGH
@@ -5008,33 +6122,22 @@ function updateOrbitTelemetry() {
       );
 
 
-  const spherical =
-    new THREE.Spherical()
-      .setFromVector3(
-        offset
-      );
+  const horizontal = Math.hypot(offset.x, offset.y);
+  const pitch = Math.atan2(offset.z, horizontal);
+  const azimuth = Math.atan2(offset.y, offset.x);
 
 
   if (viewportAzimuthEl) {
 
     viewportAzimuthEl.textContent =
-      `${THREE.MathUtils.radToDeg(
-        spherical.theta
-      ).toFixed(0)}°`;
+      `${THREE.MathUtils.radToDeg(azimuth).toFixed(0)}°`;
   }
 
 
   if (viewportPitchEl) {
 
-    const pitch =
-      90 -
-      THREE.MathUtils.radToDeg(
-        spherical.phi
-      );
-
-
     viewportPitchEl.textContent =
-      `${pitch.toFixed(0)}°`;
+      `${THREE.MathUtils.radToDeg(pitch).toFixed(0)}°`;
   }
 }
 
@@ -5081,6 +6184,11 @@ function animate() {
 function initialize() {
 
   hideLoading();
+
+
+  // Before any grid data has loaded, show the "load a terrain" note
+  // instead of a blank, unpainted (black) canvas.
+  analysisMapCardEl?.classList.add("is-empty");
 
 
   setRowStatus(
@@ -5158,12 +6266,255 @@ function initialize() {
 
 
 // ============================================================================
-// START
+// LOAD CONFIGURED TERRAIN
+// ============================================================================
+
+async function loadConfiguredTerrain() {
+
+    // SRTM metadata is independent of the NPZ analysis file — read it
+    // first, on its own, so a missing/failing NPZ (expected for a
+    // bare-terrain test) never blocks real georeferencing from showing.
+    if (viewerInputConfig && viewerInputConfig.srtmUrl) {
+
+        await loadSRTMMetadata(
+            viewerInputConfig.srtmUrl
+        );
+    }
+
+    try {
+
+        // "After" is the primary model this viewer always displays.
+        // glbUrlAfter is the current field name; glbUrl is kept as a
+        // fallback so older configs that never set glbUrlAfter still
+        // work unchanged.
+        const glbUrl =
+            viewerInputConfig.glbUrlAfter ||
+            viewerInputConfig.glbUrl;
+
+        const glbUrlBefore =
+            viewerInputConfig.glbUrlBefore;
+
+        const analysisUrl =
+            viewerInputConfig.analysisUrl;
+
+
+        console.log(
+            "[SASA MINE] Loading configured terrain..."
+        );
+
+        console.log(
+            "[SASA MINE] GLB (after):",
+            glbUrl
+        );
+
+        console.log(
+            "[SASA MINE] GLB (before):",
+            glbUrlBefore || "(none configured)"
+        );
+
+        console.log(
+            "[SASA MINE] Analysis:",
+            analysisUrl
+        );
+
+
+        // ------------------------------------------------------------
+        // LOAD NPZ
+        // ------------------------------------------------------------
+
+        const npzResponse =
+            await fetch(
+                analysisUrl
+            );
+
+
+        if (!npzResponse.ok) {
+
+            throw new Error(
+                `NPZ request failed: ${npzResponse.status}`
+            );
+
+        }
+
+
+        const npzBuffer =
+            await npzResponse.arrayBuffer();
+
+
+        console.log(
+            "[SASA MINE] NPZ fetched:",
+            npzBuffer.byteLength,
+            "bytes"
+        );
+
+
+        const npzData =
+            await loadNPZ(
+                npzBuffer
+            );
+
+
+        console.log(
+            "[SASA MINE] NPZ loaded:",
+            npzData
+        );
+
+
+        // Route through the same tested path loadGridObject() uses
+        // for manually-loaded grids, so the Grid status row, and
+        // every downstream panel, update consistently either way.
+        loadGridObject(
+            npzData
+        );
+
+
+        // Diagnostic: this tells us exactly which fields this NPZ
+        // actually contains. If elevation shows real numbers but
+        // Terrain Inspection only ever shows row/col, check this log —
+        // if slope/terrain/confidence/before/during are null/undefined
+        // here, they were never in the file, and the panel is behaving
+        // correctly by showing "---" for data that doesn't exist yet.
+        console.log(
+            "[SASA MINE] terrainData field check:",
+            {
+                hasElevation: !!terrainData?.elevation,
+                hasSlope: !!terrainData?.slope,
+                hasTerrain: !!terrainData?.terrain,
+                hasConfidence: !!terrainData?.confidence,
+                hasBefore: !!terrainData?.before,
+                hasDuring: !!terrainData?.during,
+                hasChange: !!terrainData?.change,
+            }
+        );
+
+
+        // ------------------------------------------------------------
+        // LOAD GLB — label is derived from the actual filename being
+        // loaded, never hardcoded, so it always reflects the real
+        // input the pipeline handed this viewer.
+        // ------------------------------------------------------------
+
+        const derivedLabel =
+            (viewerInputConfig && viewerInputConfig.metadata && viewerInputConfig.metadata.datasetName)
+                ? viewerInputConfig.metadata.datasetName
+                : deriveLabelFromUrl(glbUrl);
+
+        const loadedModel = await loadGLBFromURL(
+            glbUrl,
+            derivedLabel
+        );
+
+
+        // ------------------------------------------------------------
+        // BEFORE / AFTER COMPARISON — only attempted if a Before URL
+        // was actually configured. Runs after the After model is in
+        // the scene, since it reads that model's mesh list to pair
+        // against. Never blocks or fails the primary load: any
+        // mismatch just leaves the comparison slider hidden.
+        // ------------------------------------------------------------
+
+        if (glbUrlBefore && loadedModel?.root) {
+
+            await loadComparisonPair(
+                loadedModel.root,
+                glbUrlBefore
+            );
+        }
+
+
+        // ------------------------------------------------------------
+        // FINAL UI STATE
+        // ------------------------------------------------------------
+
+        updateElevationPanels();
+
+        hideLoading();
+
+        setStatus(
+            "Terrain READY"
+        );
+
+
+        console.log(
+            "[SASA MINE] Configured terrain loaded successfully."
+        );
+
+
+    } catch (error) {
+
+        console.error(
+            "[SASA MINE] Failed to load configured terrain:",
+            error
+        );
+
+
+        gridLoaded =
+            false;
+
+        terrainData =
+            null;
+
+
+        // Distinguish "no analysis file for this test case" (calm,
+        // expected) from a real GLB failure — this only covers the
+        // NPZ/grid half of loading, so phrase it accordingly rather
+        // than a generic alarming "ERROR".
+        setRowStatus(
+            statusIndicatorGridEl,
+            statusValueGridEl,
+            "No analysis data",
+            "idle"
+        );
+
+
+        hideLoading();
+
+
+        setStatus(
+            `Analysis data unavailable for this terrain: ${error.message}`,
+            false
+        );
+
+    }
+}
+
+
+// ============================================================================
+// START VIEWER
 // ============================================================================
 
 initialize();
 
 animate();
+loadConfiguredTerrain();
+window.debugTerrain = () => {
+    console.log("ACTIVE MODEL:", activeModel);
+    console.log("MODEL SIZE:", activeModel.size);
+    console.log("MODEL CENTER:", activeModel.center);
+    console.log("MODEL ROOT POSITION:", activeModel.root.position);
+    console.log("MODEL ROOT SCALE:", activeModel.root.scale);
+    console.log("CAMERA:", camera.position);
+    console.log("CONTROLS TARGET:", controls.target);
+    console.log("COMPARISON READY:", comparisonReady, "T:", comparisonT);
+    scene.traverse((o) => {
+    if (o.isMesh) {
+        console.log(
+            "TERRAIN MESH:",
+            o,
+            "visible =", o.visible,
+            "material =", o.material,
+            "frustumCulled =", o.frustumCulled
+        );
+    }
+})
+scene.traverse((o) => {
+    if (o.isMesh) {
+        o.frustumCulled = false;
+    }
+});;
+};
+
+
 
 
 // ============================================================================
@@ -5171,33 +6522,57 @@ animate();
 // ============================================================================
 
 window.loadGLBFromFile =
-  loadGLBFromFile;
+    loadGLBFromFile;
 
 window.loadGLBFromURL =
-  loadGLBFromURL;
+    loadGLBFromURL;
 
 window.loadGridFile =
-  loadGridFile;
+    loadGridFile;
 
 window.loadGridObject =
-  loadGridObject;
+    loadGridObject;
 
 window.startFlythrough =
-  startFlythrough;
+    startFlythrough;
 
 window.stopFlythrough =
-  stopFlythrough;
+    stopFlythrough;
 
 window.resetCamera =
-  resetCamera;
+    resetCamera;
 
 window.inspectTerrain =
-  inspectTerrain;
+    inspectTerrain;
 
 window.worldToGrid =
-  worldToGrid;
+    worldToGrid;
+
+// Debug: inspect the actual loaded grid data directly in console.
+// e.g. window.getTerrainData().rows, window.getGridValue(window.getTerrainData().elevation, 643, 693, window.getTerrainData().cols)
+window.getTerrainData =
+    () => terrainData;
+
+window.getGridValue =
+    getGridValue;
+
+window.getTerrainDataAt =
+    getTerrainDataAt;
+
+// Debug: Before/After comparison.
+// e.g. window.setComparisonT(0.5) to force the midpoint,
+// window.getComparisonState() to inspect readiness.
+window.setComparisonT =
+    (t) => applyComparisonT(Number(t));
+
+window.getComparisonState =
+    () => ({
+        ready: comparisonReady,
+        t: comparisonT,
+        meshCount: comparisonEntries.length,
+    });
 
 
 console.log(
-  "[SASA MINE] main.js successfully loaded."
+    "[SASA MINE] main.js successfully loaded."
 );
